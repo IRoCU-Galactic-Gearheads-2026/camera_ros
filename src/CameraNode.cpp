@@ -15,7 +15,6 @@
 #include <cv_bridge/cv_bridge.h>
 #endif
 #include <atomic>
-#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <iostream>
 #include <libcamera/base/shared_fd.h>
 #include <libcamera/base/signal.h>
@@ -63,6 +62,155 @@
 #include <utility>
 #include <vector>
 
+#include <opencv2/opencv.hpp>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+
+#include <signal.h>
+
+class MjpegServer {
+public:
+    MjpegServer() {
+	// Ignore SIGPIPE so disconnected web clients don't kill the ROS node
+        signal(SIGPIPE, SIG_IGN);
+        // ---------------------
+
+        // Setup socket inside constructor so we can safely shut it down later
+        server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        int opt = 1;
+        setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in address;
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = INADDR_ANY;
+        address.sin_port = htons(8080); // Stream port
+
+        bind(server_fd_, (struct sockaddr *)&address, sizeof(address));
+        listen(server_fd_, 5);
+
+        // Start both our heavy-lifting thread and our web server thread
+        encode_thread_ = std::thread(&MjpegServer::encodeLoop, this);
+        server_thread_ = std::thread(&MjpegServer::serverLoop, this);
+    }
+    
+    ~MjpegServer() {
+        running_ = false;
+        
+        // Force unblock the accept() call so ROS can actually shut down cleanly on Ctrl+C
+        if (server_fd_ >= 0) shutdown(server_fd_, SHUT_RDWR);
+        
+        raw_cond_var_.notify_all();
+        jpeg_cond_var_.notify_all();
+        
+        if (encode_thread_.joinable()) encode_thread_.join();
+        if (server_thread_.joinable()) server_thread_.join();
+        
+        if (server_fd_ >= 0) close(server_fd_);
+    }
+
+    void updateFrame(const cv::Mat& frame) {
+        // LIGHTNING FAST: Deep copy the frame and return instantly.
+        // This completely prevents libcamera buffer starvation!
+        std::lock_guard<std::mutex> lock(raw_mutex_);
+        frame.copyTo(latest_raw_frame_);
+        raw_cond_var_.notify_one();
+    }
+
+private:
+    int server_fd_;
+    std::thread server_thread_;
+    std::thread encode_thread_;
+    
+    std::mutex raw_mutex_;
+    std::condition_variable raw_cond_var_;
+    cv::Mat latest_raw_frame_;
+
+    std::mutex jpeg_mutex_;
+    std::condition_variable jpeg_cond_var_;
+    std::vector<uchar> latest_jpeg_;
+    
+    bool running_ = true;
+
+    void encodeLoop() {
+        while (running_) {
+            cv::Mat frame_to_encode;
+            {
+                std::unique_lock<std::mutex> lock(raw_mutex_);
+                // Sleep until the camera hardware thread wakes us up with a new frame
+                raw_cond_var_.wait(lock, [this]{ return !latest_raw_frame_.empty() || !running_; });
+                if (!running_) break;
+                
+                // Grab the frame quickly to free up the mutex
+                latest_raw_frame_.copyTo(frame_to_encode);
+                latest_raw_frame_.release(); 
+            }
+
+            if (frame_to_encode.empty()) continue;
+
+            // HEAVY LIFTING OFF-THREAD: cv::imencode no longer crashes the camera_node!
+            std::vector<uchar> buf;
+            cv::Mat bgr_frame;
+            if (frame_to_encode.channels() == 4) {
+                cv::cvtColor(frame_to_encode, bgr_frame, cv::COLOR_BGRA2BGR);
+            } else {
+                bgr_frame = frame_to_encode;
+            }
+
+            cv::imencode(".jpg", bgr_frame, buf, {cv::IMWRITE_JPEG_QUALITY, 60});
+            
+            // Pass the finished JPEG over to the web socket thread
+            {
+                std::lock_guard<std::mutex> lock(jpeg_mutex_);
+                latest_jpeg_ = std::move(buf);
+            }
+            jpeg_cond_var_.notify_all();
+        }
+    }
+
+    void serverLoop() {
+        while (running_) {
+            int client_socket = accept(server_fd_, nullptr, nullptr);
+            if (client_socket < 0) continue;
+
+            std::string header = "HTTP/1.1 200 OK\r\n"
+                                 "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+            if (write(client_socket, header.c_str(), header.length()) < 0) {
+                close(client_socket);
+                continue;
+            }
+
+            while (running_) {
+                std::vector<uchar> jpeg_copy;
+                {
+                    std::unique_lock<std::mutex> lock(jpeg_mutex_);
+                    // Wait for the encode thread to finish a JPEG
+                    jpeg_cond_var_.wait(lock);
+                    if (!running_) break;
+                    jpeg_copy = latest_jpeg_;
+                }
+
+                if (jpeg_copy.empty()) continue;
+
+                std::string frame_header = "--frame\r\n"
+                                           "Content-Type: image/jpeg\r\n"
+                                           "Content-Length: " + std::to_string(jpeg_copy.size()) + "\r\n\r\n";
+
+                if (write(client_socket, frame_header.c_str(), frame_header.length()) < 0) break;
+                if (write(client_socket, jpeg_copy.data(), jpeg_copy.size()) < 0) break;
+                if (write(client_socket, "\r\n", 2) < 0) break;
+            }
+            close(client_socket);
+        }
+    }
+};
+
+// Global instance of the server
+std::shared_ptr<MjpegServer> mjpeg_server = nullptr;
+
 namespace rclcpp
 {
 class NodeOptions;
@@ -79,6 +227,11 @@ public:
   ~CameraNode();
 
 private:
+  // --- MJPEG Rate Limiter Variables ---
+  rclcpp::Time last_mjpeg_time_;
+  double mjpeg_framerate_;
+  // ------------------------------------
+
   libcamera::CameraManager camera_manager;
   std::shared_ptr<libcamera::Camera> camera;
   libcamera::Stream *stream;
@@ -101,7 +254,6 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_image;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_image_compressed;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr pub_ci;
-  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr pub_diagnostics;
 
   camera_info_manager::CameraInfoManager cim;
 
@@ -245,6 +397,27 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
 #endif
       )
 {
+
+    // --- MJPEG Server Parameter ---
+  rcl_interfaces::msg::ParameterDescriptor param_descr_mjpeg;
+  param_descr_mjpeg.description = "Enable MJPEG WebSocket server on port 8080";
+  param_descr_mjpeg.read_only = true;
+  bool enable_mjpeg = declare_parameter<bool>("enable_mjpeg_server", false, param_descr_mjpeg);
+
+  // NEW: Declare the framerate parameter (Defaults to 30.0 FPS)
+  rcl_interfaces::msg::ParameterDescriptor param_descr_mjpeg_fps;
+  param_descr_mjpeg_fps.description = "Target framerate for the MJPEG stream";
+  mjpeg_framerate_ = declare_parameter<double>("mjpeg_framerate", 30.0, param_descr_mjpeg_fps);
+  
+  // Initialize the timer
+  last_mjpeg_time_ = this->now();
+
+  if (enable_mjpeg && !mjpeg_server) {
+      mjpeg_server = std::make_shared<MjpegServer>();
+      RCLCPP_INFO(this->get_logger(), "MJPEG Server started on port 8080 at %.1f FPS", mjpeg_framerate_);
+  }
+  // ------------------------------
+  
   // pixel format
   rcl_interfaces::msg::ParameterDescriptor param_descr_format;
   param_descr_format.description = "pixel format of streaming buffer";
@@ -331,8 +504,6 @@ CameraNode::CameraNode(const rclcpp::NodeOptions &options)
   pub_image_compressed =
     this->create_publisher<sensor_msgs::msg::CompressedImage>("~/image_raw/compressed", 1);
   pub_ci = this->create_publisher<sensor_msgs::msg::CameraInfo>("~/camera_info", 1);
-  pub_diagnostics =
-    this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 1);
 
   // start camera manager and check for cameras
   const int ec_start = camera_manager.start();
@@ -665,27 +836,8 @@ CameraNode::process(libcamera::Request *const request)
     // Adjust timestamp by the sensor latency
     hdr.stamp = this->now() - rclcpp::Duration::from_nanoseconds(sensor_latency);
 
-    diagnostic_msgs::msg::DiagnosticArray diagnostic_array;
-    diagnostic_array.header = hdr;
-
-    diagnostic_msgs::msg::DiagnosticStatus diagnostic_status;
-    diagnostic_status.hardware_id = camera->id();
-
     if (request->status() == libcamera::Request::RequestComplete) {
       assert(request->buffers().size() == 1);
-
-      diagnostic_status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
-
-      // publish metadata, sorted by control ID
-      for (const auto &[id, value] : std::map {
-             request->metadata().begin(),
-             request->metadata().end(),
-           }) {
-        diagnostic_msgs::msg::KeyValue kv;
-        kv.key = libcamera::controls::controls.at(id)->name();
-        kv.value = value.toString();
-        diagnostic_status.values.push_back(kv);
-      }
 
       // get the stream and buffer from the request
       const libcamera::FrameBuffer *buffer = request->findBuffer(stream);
@@ -740,21 +892,48 @@ CameraNode::process(libcamera::Request *const request)
                                  stream->configuration().pixelFormat.toString());
       }
 
+      // --- CUSTOM DUAL-STREAM INJECTION ---
+    // 1. Wrap the raw camera buffer in an OpenCV Mat. 
+    int cv_type = (msg_img->step / msg_img->width == 4) ? CV_8UC4 : CV_8UC3;
+    cv::Mat raw_hd_frame(msg_img->height, msg_img->width, cv_type, msg_img->data.data());
+
+    // 2. Send the 1280x720 frame to the embedded Web Server (Rate Limited)
+    if (mjpeg_server) {
+        auto current_time = this->now();
+        double elapsed_sec = (current_time - last_mjpeg_time_).seconds();
+        
+        // Only encode and send if enough time has passed based on our target framerate
+        if (mjpeg_framerate_ > 0.0 && elapsed_sec >= (1.0 / mjpeg_framerate_)) {
+            mjpeg_server->updateFrame(raw_hd_frame);
+            last_mjpeg_time_ = current_time;
+        }
+    }
+
+    // 3. Resize the frame to 640x480 for ROS Odometry (Always runs at 120fps)
+    cv::Mat resized_sd_frame;
+    cv::resize(raw_hd_frame, resized_sd_frame, cv::Size(640, 480));
+
+    // 4. Overwrite the ROS message with the smaller 640x480 data
+    msg_img->width = 640;
+    msg_img->height = 480;
+    msg_img->step = 640 * (cv_type == CV_8UC4 ? 4 : 3);
+    size_t new_size = msg_img->step * msg_img->height;
+    msg_img->data.assign(resized_sd_frame.data, resized_sd_frame.data + new_size);
+    // ------------------------------------
+    
+      // Let camera_ros publish the now-resized message normally
       pub_image->publish(std::move(msg_img));
+      
       pub_image_compressed->publish(std::move(msg_img_compressed));
 
       sensor_msgs::msg::CameraInfo ci = cim.getCameraInfo();
       ci.header = hdr;
       pub_ci->publish(ci);
-    }
+    }    
+
     else if (request->status() == libcamera::Request::RequestCancelled) {
-      diagnostic_status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
       RCLCPP_ERROR_STREAM(get_logger(), "request '" << request->toString() << "' cancelled");
     }
-
-    diagnostic_array.status.push_back(diagnostic_status);
-
-    pub_diagnostics->publish(diagnostic_array);
 
     // redeclare implicitly undeclared parameters
     parameter_handler.redeclare();

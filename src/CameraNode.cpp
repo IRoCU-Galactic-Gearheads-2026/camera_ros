@@ -628,9 +628,25 @@ void CameraNode::process(libcamera::Request *const request)
             }
         }
 
+        // msg_img->header = hdr;
+        // msg_img->width = 640;
+        // msg_img->height = 480;
+        // msg_img->step = 640 * (cv_type == CV_8UC4 ? 4 : 3);
+        // msg_img->encoding = get_ros_encoding(cfg.pixelFormat);
+        // msg_img->is_bigendian = (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
+        
+        // size_t new_size = msg_img->step * msg_img->height;
+        // msg_img->data.resize(new_size);
+
+        // cv::Mat resized_sd_frame(480, 640, cv_type, msg_img->data.data());
+
+        // // USE INTER_NEAREST FOR EXTREMELY FAST SCALING ON RPI 5
+        // cv::resize(raw_hd_frame, resized_sd_frame, cv::Size(640, 480), 0, 0, cv::INTER_NEAREST);
+
+	// --- UPDATE STARTS HERE ---
         msg_img->header = hdr;
         msg_img->width = 640;
-        msg_img->height = 480;
+        msg_img->height = 360; // <-- Changed to 360 to preserve 16:9 geometry
         msg_img->step = 640 * (cv_type == CV_8UC4 ? 4 : 3);
         msg_img->encoding = get_ros_encoding(cfg.pixelFormat);
         msg_img->is_bigendian = (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__);
@@ -638,11 +654,13 @@ void CameraNode::process(libcamera::Request *const request)
         size_t new_size = msg_img->step * msg_img->height;
         msg_img->data.resize(new_size);
 
-        cv::Mat resized_sd_frame(480, 640, cv_type, msg_img->data.data());
+        // <-- Changed to 360
+        cv::Mat resized_sd_frame(360, 640, cv_type, msg_img->data.data());
 
-        // USE INTER_NEAREST FOR EXTREMELY FAST SCALING ON RPI 5
-        cv::resize(raw_hd_frame, resized_sd_frame, cv::Size(640, 480), 0, 0, cv::INTER_NEAREST);
-
+        // <-- EXACT 50% SCALE triggers OpenCV's ultra-fast SIMD hardware decimation
+        cv::resize(raw_hd_frame, resized_sd_frame, cv::Size(640, 360), 0, 0, cv::INTER_AREA);
+        // --- UPDATE ENDS HERE ---
+	
         if (pub_image_compressed->get_subscription_count()) {
           try { compressImageMsg(*msg_img, *msg_img_compressed, {cv::IMWRITE_JPEG_QUALITY, jpeg_quality}); }
           catch (const cv_bridge::Exception &e) { RCLCPP_ERROR_STREAM(get_logger(), e.what()); }
